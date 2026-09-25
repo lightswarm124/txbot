@@ -1,0 +1,48 @@
+# Public, non-secret Chipnet defaults.
+# Keep the mnemonic in an external secret store or process environment.
+
+network = "chipnet"
+
+# Try endpoints in priority order. CashScript's ElectrumNetworkProvider uses
+# the standard encrypted Electrum port (50002) when given a hostname. The
+# OPTN endpoint is listed with its public WebSocket transport because that is
+# the transport used by the existing Chipnet test helper.
+[[electrum_endpoints]]
+name = "bch-ninja"
+host = "chipnet.bch.ninja"
+port = 50002
+transport = "tls"
+priority = 10
+
+[[electrum_endpoints]]
+name = "imaginary-cash"
+host = "chipnet.imaginary.cash"
+port = 50002
+transport = "tls"
+priority = 20
+
+[[electrum_endpoints]]
+name = "optnlabs"
+host = "electrum-chipnet.optnlabs.com"
+port = 50004
+transport = "wss"
+priority = 30
+
+# Compatibility default for adapters that accept one CashScript hostname.
+electrum_host = "chipnet.bch.ninja"
+electrum_port = 50002
+electrum_transport = "tls"
+
+# BIP44: m / purpose' / coin_type' / account' / change / address_index
+bip44_purpose = 44
+bip44_coin_type = 1
+bip44_account = 0
+bip44_change = 0
+
+# The bot must not sign or broadcast unless a separate run is explicitly
+# authorized. Keep this false for development and fixture tests.
+allow_broadcast = false
+
+# Riften Labs' Chipnet Cauldron indexer. The transaction harness currently
+# uses this endpoint for read-only market discovery and dry-run planning.
+cauldron_indexer_base_url = "https://indexer-chipnet.riften.net/cauldron"

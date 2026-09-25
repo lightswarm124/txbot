@@ -1,0 +1,10 @@
+# Local secrets and runtime overrides. Never commit these files.
+.env
+.env.*
+!.env.example
+
+# Local experiment output.
+reports/*.local.*
+
+# Dependencies
+node_modules/
