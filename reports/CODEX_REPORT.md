@@ -314,3 +314,79 @@ live test should begin with a small sequential boundary batch and stop on the
 first `missing inputs`, ancestor-limit, or visibility error. Sustaining 1,000
 simultaneous unconfirmed transactions may require a fan-out of independent BCH
 and pool roots rather than one 1,000-deep chain.
+
+## Iteration 7 — Live 1,000-transaction sequential batch
+
+### Command and result
+
+The explicitly authorized live command was run on Chipnet with one pinned
+Electrum endpoint, 1,000 iterations, 10,000 sats per order, and a 10,000,000
+sat input cap. It completed in 191,332 ms with status `completed`.
+
+Measured runner metrics:
+
+- 1,000 candidates signed and 1,000 transactions attempted;
+- 1,000 endpoint acknowledgements and 1,000 endpoint visibility checks;
+- 0 rejects, retries, conflicts, give-ups, or visibility failures;
+- 1,000 unique pool outpoints touched;
+- average build latency 40 ms and broadcast/visibility latency 151 ms;
+- serialized size 445–447 bytes and fee 445–447 sats, with exact 1 sat/byte
+  true for all 1,000 samples;
+- maximum pending dependency depth 1,000; final local state retained 1 native
+  change UTXO and 6 active pool successor UTXOs.
+
+### Post-batch state
+
+- `npm run cauldron:verify-pools` passed with Riften showing 3 matching pools,
+  30,144,708 pool sats, and 9,357 PUSD units. Electrum showed the same 3
+  unspent pool outputs and aggregate sats; both `indexed` and
+  `pendingOrConfirmedOnElectrum` were true.
+- `npm run verify:wallet` observed 1,003 wallet UTXOs, 1,002 token UTXOs,
+  1,002 PUSD UTXOs, and 1 unconfirmed history entry. Its nonzero exit remains
+  expected because it checks the obsolete 500,000,000-satoshi pre-setup
+  baseline; its aggregate sat total includes token-bearing outputs and is not
+  the runner's native-only balance.
+
+### Assessment
+
+The public Chipnet endpoint accepted and exposed the entire 1,000-deep
+unconfirmed sequence to the runner, so this experiment achieved its target.
+The remaining unconfirmed tip should be allowed to settle before another
+spend batch. No raw transactions, signatures, wallet identifiers, or secret
+material were recorded.
+
+## Iteration 8 — Mixed buy/sell position-preservation preparation
+
+### Hypothesis
+
+Alternating BCH-to-PUSD buys and PUSD-to-BCH sells can preserve the wallet's
+PUSD position while exercising both directions against unconfirmed pool and
+wallet UTXOs.
+
+### Changes
+
+- Added `--flow=mixed`, restricted to sequential mode.
+- Sell legs consume a PUSD UTXO matching the configured buy demand when
+  possible, rather than selecting an arbitrary token lot.
+- The local ledger now tracks native BCH, PUSD, and pool UTXOs together,
+  including token change outputs and unconfirmed origins.
+- Runner output includes initial and pending PUSD UTXO/unit counts.
+
+### Measured preparation
+
+Command:
+
+```text
+npm run cauldron:hf -- --prepare --flow=mixed --mode=sequential --iterations=4 --workers=1 --order-sats=10000 --max-input-sats=1000000
+```
+
+The preparation passed with 4 signed candidates and zero broadcasts. Initial
+wallet position was 3,004 PUSD units across 1,002 PUSD UTXOs; the prepared
+ending position was also 3,004 PUSD units across 1,002 PUSD UTXOs. The run
+touched 4 pool outpoints, reached dependency depth 4, and passed exact
+1 sat/byte validation for all candidates. Fee samples ranged from 447 to 586
+bytes/sats. No live mixed-flow batch has been broadcast yet.
+
+The planned live 1,000-leg command alternates 500 buys and 500 sells. BCH
+position variance will include pool pricing and transaction fees; PUSD unit
+variance should remain near zero when matching lots are available.

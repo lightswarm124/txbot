@@ -45,9 +45,11 @@ const DEFAULT_VISIBILITY_DELAY_MS = 50;
 
 type RunMode = 'sequential' | 'contention';
 type Action = 'plan' | 'prepare' | 'execute';
+type Flow = 'buy' | 'mixed';
 
 type Config = {
   action: Action;
+  flow: Flow;
   runMode: RunMode;
   iterations: number;
   workers: number;
@@ -66,6 +68,7 @@ type UtxoOrigin = {
 type UtxoState = {
   pools: LivePool[];
   nativeCoins: SpendableCoin[];
+  tokenCoins: SpendableCoin[];
   origins: Map<string, UtxoOrigin>;
 };
 
@@ -75,7 +78,9 @@ type BuiltTrade = {
   txid: string;
   touchedPoolKeys: string[];
   inputKeys: string[];
+  tokenInputKeys: string[];
   dependencyDepth: number;
+  side: 'buy' | 'sell';
 };
 
 type Metrics = {
@@ -147,8 +152,14 @@ function parseConfig(): Config {
   if (runMode === 'contention' && workers < 2) {
     throw new Error('contention mode requires --workers of at least 2');
   }
+  const flow = readFlag('flow') ?? 'buy';
+  if (flow !== 'buy' && flow !== 'mixed') throw new Error('--flow must be buy or mixed');
+  if (flow === 'mixed' && runMode !== 'sequential') {
+    throw new Error('--flow=mixed currently requires --mode=sequential');
+  }
   return {
     action,
+    flow,
     runMode,
     iterations: readPositiveInteger('iterations', DEFAULT_ITERATIONS, MAX_ITERATIONS),
     workers,
@@ -183,6 +194,7 @@ function coinOutpointKey(coin: SpendableCoin): string {
 function activeUtxoKeys(state: UtxoState): Set<string> {
   return new Set([
     ...state.nativeCoins.map(coinOutpointKey),
+    ...state.tokenCoins.map(coinOutpointKey),
     ...state.pools.map(outpointKey),
   ]);
 }
@@ -193,12 +205,15 @@ function assertUniqueKeys(keys: string[], label: string): void {
 
 function assertUtxoState(state: UtxoState): void {
   const nativeKeys = state.nativeCoins.map(coinOutpointKey);
+  const tokenKeys = state.tokenCoins.map(coinOutpointKey);
   const poolKeys = state.pools.map(outpointKey);
   assertUniqueKeys(nativeKeys, 'native input');
+  assertUniqueKeys(tokenKeys, 'token input');
   assertUniqueKeys(poolKeys, 'pool input');
-  const overlap = nativeKeys.find((key) => poolKeys.includes(key));
+  const allKeys = [...nativeKeys, ...tokenKeys, ...poolKeys];
+  const overlap = allKeys.length === new Set(allKeys).size ? undefined : 'overlap';
   if (overlap) throw new Error('UTXO ledger native/pool outpoint overlap');
-  const active = new Set([...nativeKeys, ...poolKeys]);
+  const active = new Set(allKeys);
   for (const key of state.origins.keys()) {
     if (!active.has(key)) throw new Error('UTXO ledger retained a spent outpoint');
   }
@@ -319,7 +334,110 @@ function buildBuyTrade(
     txid: hashTransaction(encodeTransaction(result.libauth_generated_transaction)),
     touchedPoolKeys: trade.entries.map((entry) => outpointKey(entry.pool)),
     inputKeys,
+    tokenInputKeys: [],
     dependencyDepth,
+    side: 'buy',
+  };
+}
+
+function buildSellTrade(
+  lab: ExchangeLab,
+  wallet: Wallet,
+  state: UtxoState,
+  iteration: number,
+  targetTokenAmount: bigint,
+): BuiltTrade {
+  const tokenCoin = state.tokenCoins.find((coin) => coin.output.token?.amount === targetTokenAmount) ??
+    state.tokenCoins.reduce<SpendableCoin | undefined>((closest, coin) => {
+      if (!closest) return coin;
+      const currentDistance = (coin.output.token?.amount ?? 0n) > targetTokenAmount
+        ? (coin.output.token?.amount ?? 0n) - targetTokenAmount
+        : targetTokenAmount - (coin.output.token?.amount ?? 0n);
+      const closestDistance = (closest.output.token?.amount ?? 0n) > targetTokenAmount
+        ? (closest.output.token?.amount ?? 0n) - targetTokenAmount
+        : targetTokenAmount - (closest.output.token?.amount ?? 0n);
+      return currentDistance < closestDistance ? coin : closest;
+    }, undefined);
+  const tokenAmount = tokenCoin?.output.token?.amount;
+  if (!tokenCoin || tokenCoin.output.token?.token_id !== CAULDRON_PUSD_TOKEN_ID || !tokenAmount || tokenAmount <= 0n) {
+    throw new Error('Mixed flow has no spendable PUSD UTXO for the sell leg');
+  }
+  const trade = lab.constructTradeBestRateForTargetSupply(
+    CAULDRON_PUSD_TOKEN_ID,
+    'BCH',
+    tokenAmount,
+    state.pools,
+    FEE_RATE_SATS_PER_BYTE,
+  );
+  if (trade.entries.length === 0 || trade.summary.demand <= 0n) {
+    throw new Error('Cauldron returned no positive BCH demand for the sell leg');
+  }
+  const result = lab.createTradeTx(
+    trade.entries,
+    [...state.nativeCoins, tokenCoin],
+    [
+      {
+        type: PayoutAmountRuleType.FIXED,
+        locking_bytecode: wallet.lockingBytecode,
+        amount: trade.summary.demand,
+      },
+      {
+        type: PayoutAmountRuleType.CHANGE,
+        locking_bytecode: wallet.lockingBytecode,
+        spending_parameters: { type: SpendableCoinType.P2PKH, key: wallet.key },
+      },
+    ],
+    dataLockingBytecode(iteration, 0),
+    FEE_RATE_SATS_PER_BYTE,
+  );
+  lab.verifyTradeTx(result);
+  const vmResult = createVirtualMachineBCH().verify({
+    sourceOutputs: result.libauth_source_outputs,
+    transaction: result.libauth_generated_transaction,
+  });
+  if (typeof vmResult === 'string') throw new Error('Sell candidate failed BCH virtual-machine validation');
+  assertExactOneSatPerByte(result.txbin.length, result.txfee);
+  if (result.token_burns.length !== 0) throw new Error('Sell candidate unexpectedly burns PUSD');
+
+  const outputs = result.libauth_generated_transaction.outputs;
+  const poolOutputs = outputs.slice(0, trade.entries.length);
+  if (poolOutputs.some((output) =>
+    !output.token || binToHex(output.token.category) !== CAULDRON_PUSD_TOKEN_ID || output.valueSatoshis <= 693n,
+  )) {
+    throw new Error('Sell candidate has an invalid successor pool output');
+  }
+  const fixedBchOutputs = result.payouts_info.filter((payout) =>
+    payout.payout_rule.type === PayoutAmountRuleType.FIXED &&
+    binToHex(payout.output.locking_bytecode) === binToHex(wallet.lockingBytecode) &&
+    !payout.output.token && payout.output.amount === trade.summary.demand,
+  );
+  if (fixedBchOutputs.length !== 1) throw new Error('Sell candidate has an invalid BCH payout');
+
+  const allowedInputKeys = new Set([
+    ...state.nativeCoins.map(coinOutpointKey),
+    coinOutpointKey(tokenCoin),
+    ...trade.entries.map((entry) => outpointKey(entry.pool)),
+  ]);
+  const inputKeys = result.libauth_generated_transaction.inputs.map((input) =>
+    resolveInputKey(input, allowedInputKeys));
+  assertUniqueKeys(inputKeys, 'sell candidate input');
+  const ledgerKeys = activeUtxoKeys(state);
+  if (inputKeys.some((key) => !ledgerKeys.has(key))) {
+    throw new Error('Sell candidate spends a stale or unavailable UTXO');
+  }
+  const dependencyDepth = Math.max(
+    0,
+    ...inputKeys.map((key) => state.origins.get(key)?.depth ?? 0),
+  ) + 1;
+  return {
+    result,
+    trade,
+    txid: hashTransaction(encodeTransaction(result.libauth_generated_transaction)),
+    touchedPoolKeys: trade.entries.map((entry) => outpointKey(entry.pool)),
+    inputKeys,
+    tokenInputKeys: [coinOutpointKey(tokenCoin)],
+    dependencyDepth,
+    side: 'sell',
   };
 }
 
@@ -374,6 +492,22 @@ function advanceUtxoState(state: UtxoState, wallet: Wallet, built: BuiltTrade): 
 
   const nextPools = advancePoolState(state.pools, built);
   const nextNativeCoins = advanceWalletState(wallet, built);
+  const consumedTokenKeys = new Set(built.tokenInputKeys);
+  const nextTokenCoins: SpendableCoin[] = state.tokenCoins
+    .filter((coin) => !consumedTokenKeys.has(coinOutpointKey(coin)))
+    .concat(
+      built.result.payouts_info
+        .filter((payout) =>
+          binToHex(payout.output.locking_bytecode) === binToHex(wallet.lockingBytecode) &&
+          payout.output.token?.token_id === CAULDRON_PUSD_TOKEN_ID,
+        )
+        .map((payout) => ({
+          type: SpendableCoinType.P2PKH,
+          key: wallet.key,
+          outpoint: { txhash: hexToBin(built.txid), index: payout.index },
+          output: payout.output,
+        })),
+    );
   const origins = new Map(state.origins);
   for (const inputKey of built.inputKeys) origins.delete(inputKey);
   for (let index = 0; index < built.trade.entries.length; index++) {
@@ -382,12 +516,12 @@ function advanceUtxoState(state: UtxoState, wallet: Wallet, built: BuiltTrade): 
   for (const payout of built.result.payouts_info) {
     if (
       binToHex(payout.output.locking_bytecode) === binToHex(wallet.lockingBytecode) &&
-      !payout.output.token
+      (!payout.output.token || payout.output.token.token_id === CAULDRON_PUSD_TOKEN_ID)
     ) {
       origins.set(`${built.txid}:${payout.index}`, { txid: built.txid, depth: built.dependencyDepth });
     }
   }
-  const nextState = { pools: nextPools, nativeCoins: nextNativeCoins, origins };
+  const nextState = { pools: nextPools, nativeCoins: nextNativeCoins, tokenCoins: nextTokenCoins, origins };
   assertUtxoState(nextState);
   return nextState;
 }
@@ -480,6 +614,9 @@ async function main(): Promise<void> {
   const walletUtxos = await listScriptUtxos(wallet.scriptHash);
   const walletCoins = toSpendableCoins(walletUtxos, wallet);
   const nativeCoins = walletCoins.filter((coin) => !coin.output.token);
+  const tokenCoins = walletCoins.filter((coin) =>
+    coin.output.token?.token_id === CAULDRON_PUSD_TOKEN_ID,
+  );
   const nativeBalance = nativeCoins.reduce((sum, coin) => sum + coin.output.amount, 0n);
   if (nativeBalance < attemptedInputSats) throw new Error('Native BCH balance is below the configured test input cap');
 
@@ -487,9 +624,10 @@ async function main(): Promise<void> {
   if (pools.length === 0) throw new Error('No live PUSD pools were found on Electrum');
   const origins = new Map<string, UtxoOrigin>();
   const nativeKeys = new Set(nativeCoins.map(coinOutpointKey));
+  const tokenKeys = new Set(tokenCoins.map(coinOutpointKey));
   for (const utxo of walletUtxos) {
     const key = `${utxo.tx_hash.toLowerCase()}:${utxo.tx_pos}`;
-    if (utxo.height === 0 && nativeKeys.has(key)) {
+    if (utxo.height === 0 && (nativeKeys.has(key) || tokenKeys.has(key))) {
       origins.set(key, {
         txid: utxo.tx_hash.toLowerCase(),
         depth: 1,
@@ -504,7 +642,7 @@ async function main(): Promise<void> {
       });
     }
   }
-  let state: UtxoState = { pools, nativeCoins, origins };
+  let state: UtxoState = { pools, nativeCoins, tokenCoins, origins };
   assertUtxoState(state);
   const uniquePools = new Set<string>();
   const metrics = createMetrics(config);
@@ -521,6 +659,7 @@ async function main(): Promise<void> {
     network: 'chipnet',
     tokenId: CAULDRON_PUSD_TOKEN_ID,
     action: config.action,
+    flow: config.flow,
     runMode: config.runMode,
     iterations: config.iterations,
     workers: config.workers,
@@ -531,6 +670,8 @@ async function main(): Promise<void> {
     indexedPoolCount: pools.filter((pool) => pool.source === 'indexer').length,
     walletOwnedPoolCount: pools.filter((pool) => pool.source === 'wallet').length,
     initialQuotedPusdUnits: initialQuote.summary.demand.toString(),
+    initialPusdUtxoCount: tokenCoins.length,
+    initialPusdUnits: tokenCoins.reduce((sum, coin) => sum + (coin.output.token?.amount ?? 0n), 0n).toString(),
     nativeWalletBalanceSats: nativeBalance.toString(),
     initialUnconfirmedWalletUtxos: walletUtxos.filter((utxo) => utxo.height === 0).length,
     initialUnconfirmedPoolOutputs: pools.filter((pool) => pool.height === 0).length,
@@ -560,14 +701,17 @@ async function main(): Promise<void> {
     const batchBuildStart = performance.now();
     try {
       for (let worker = 0; worker < config.workers; worker++) {
-        const built = buildBuyTrade(
-          lab,
-          wallet,
-          state,
-          config.orderSats,
-          iteration,
-          config.runMode === 'contention' ? worker + 1 : 0,
-        );
+        const mixedSell = config.flow === 'mixed' && iteration % 2 === 1;
+        const built = mixedSell
+          ? buildSellTrade(lab, wallet, state, iteration, initialQuote.summary.demand)
+          : buildBuyTrade(
+            lab,
+            wallet,
+            state,
+            config.orderSats,
+            iteration,
+            config.runMode === 'contention' ? worker + 1 : 0,
+          );
         batch.push(built);
         signedCandidates++;
         metrics.feeEvidence.push({
@@ -648,6 +792,8 @@ async function main(): Promise<void> {
       ...summarizeMetrics(metrics),
       uniquePoolsTouched: uniquePools.size,
       pendingNativeUtxos: state.nativeCoins.length,
+      pendingPusdUtxos: state.tokenCoins.length,
+      pendingPusdUnits: state.tokenCoins.reduce((sum, coin) => sum + (coin.output.token?.amount ?? 0n), 0n).toString(),
       pendingPoolOutputs: state.pools.filter((pool) => state.origins.has(outpointKey(pool))).length,
       pendingUtxoCount: state.origins.size,
     },

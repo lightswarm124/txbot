@@ -116,6 +116,18 @@ memory but does not broadcast, use:
 npm run cauldron:hf -- --prepare --mode=sequential --iterations=1000 --workers=1 --order-sats=10000 --max-input-sats=10000000
 ```
 
+To alternate BCH-to-PUSD buys and PUSD-to-BCH sells, preserving the starting
+PUSD position as closely as available lot sizes and market pricing allow, use
+the mixed flow:
+
+```text
+npm run cauldron:hf -- --execute --flow=mixed --mode=sequential --iterations=1000 --workers=1 --order-sats=10000 --max-input-sats=10000000 --broadcast-endpoint=0 --visibility-attempts=3 --visibility-delay-ms=50
+```
+
+Mixed flow starts with a buy, sells a matching-size PUSD UTXO on the next leg,
+and repeats. It requires an existing PUSD balance and currently supports
+sequential mode only.
+
 The sequential runner maintains a local UTXO ledger: each candidate must spend
 only active native/pool outpoints, then its unconfirmed BCH change and pool
 successors become the next candidate's inputs. It advances this ledger during
